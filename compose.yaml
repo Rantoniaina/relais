@@ -1,0 +1,26 @@
+name: relais
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: relais
+      POSTGRES_USER: relais
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-relais}
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql   # PG 18 : PGDATA = /var/lib/postgresql/18/docker
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relais -d relais"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama
+    ports: ["11434:11434"]
+    volumes:
+      - ollama:/root/.ollama
+
+volumes:
+  pgdata:
+  ollama:
