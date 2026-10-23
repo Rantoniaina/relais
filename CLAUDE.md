@@ -19,10 +19,15 @@ Relais est un monorepo (voir `docs/adr/0001-monorepo.md`) : services dans `servi
 ## Infra locale (racine du dépôt)
 
 ```bash
-docker compose up -d            # postgres:18 (5432) + ollama/ollama (11434)
-docker compose down -v          # supprime aussi les volumes (données Postgres et modèles Ollama)
+docker compose up -d                  # postgres:18 (5432) + ollama/ollama (11434) + gateway (8080)
+docker compose up -d postgres ollama  # infra seule, pour lancer le gateway sur l'hôte
+docker compose build gateway          # --pull pour récupérer une nouvelle image eclipse-temurin
+docker compose down -v                # supprime aussi les volumes (données Postgres et modèles Ollama)
 docker compose exec ollama ollama pull <modèle>
 ```
+
+- Le gateway de compose et un `./mvnw spring-boot:run` sur l'hôte se disputent le port 8080 : un seul à la fois.
+- Dans compose, le gateway joint Postgres via `DB_HOST=postgres` et ne démarre qu'une fois le healthcheck `pg_isready` passé (`depends_on: condition: service_healthy`).
 
 - Postgres 18 : le volume est monté sur `/var/lib/postgresql` (et non `/data`), car depuis la v18 `PGDATA` vaut `/var/lib/postgresql/18/docker`.
 - Le mot de passe vient de `POSTGRES_PASSWORD` (`.env` à la racine, ignoré par git ; défaut `relais`). Il n'est appliqué qu'à l'initialisation du volume. S'il change ensuite, l'authentification échoue tant que le volume n'est pas recréé.
@@ -45,9 +50,18 @@ Spring Boot 4.1 (Web MVC, JDBC, Flyway, Actuator), Java 25, Maven wrapper. Toute
 - Configuration dans `src/main/resources/application.yaml`, surchargée par des variables d'environnement : `DB_HOST`, `DB_PORT`, `DB_USER`, `POSTGRES_PASSWORD`. Spring ne lit pas `.env` : il faut l'exporter dans le shell ou dans la configuration de lancement de l'IDE.
 - Actuator expose `health` et `info`, avec `show-details: always` sur `/actuator/health`.
 
+### Image Docker (`Dockerfile`, voir `docs/adr/0002-image-gateway.md`)
+
+- Multi-stage. Le builder (`eclipse-temurin:25-jdk`) copie d'abord `mvnw`, `.mvn/` et `pom.xml` et lance `dependency:go-offline`, puis copie `src/` et lance `package -DskipTests`. Les deux `RUN` Maven montent le même cache BuildKit sur `/root/.m2`. Ce qui est écrit dans un cache mount n'entre pas dans l'image : retirer le mount d'un des deux `RUN` le fait tout retélécharger.
+- Les tests sont sautés au build parce qu'ils exigent un Postgres.
+- Le jar est extrait avec `-Djarmode=tools extract --layers`. L'image finale (`eclipse-temurin:25-jre`, utilisateur non-root `relais`) copie les 4 couches dans le même `/app`, de la plus stable à la plus volatile : `dependencies`, `spring-boot-loader`, `snapshot-dependencies`, `application`. Le `application.jar` mince résout son `Class-Path` vers `lib/`, ce qui suppose les 4 couches au même endroit.
+- La heap est limitée par `JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75`, calculé sur la limite mémoire du conteneur (sans limite, sur toute la RAM de la VM Docker).
+- Le contexte de build est `services/gateway` : c'est son `.dockerignore` qui s'applique, pas un fichier à la racine.
+
 ### Base de données et Flyway
 
 - Toutes les tables vivent dans le schéma `relais`. Flyway le crée et y place `flyway_schema_history` (`spring.flyway.schemas` / `default-schema`). Les migrations n'écrivent donc pas de préfixe `relais.`.
 - Les requêtes de l'application ne fixent pas de schéma. Elles s'appuient sur le `search_path` par défaut de Postgres (`"$user", public`), qui résout vers `relais` parce que l'utilisateur s'appelle `relais`. Changer d'utilisateur DB casserait cette résolution.
 - Migrations : `src/main/resources/db/migration/V<n>__<description>.sql`, avec **deux** underscores. Avec un seul, Flyway ignore le fichier sans erreur. Ne jamais modifier une migration déjà appliquée (le checksum est vérifié au démarrage) : ajouter une nouvelle version à la place.
-- `provider` (V1) : `kind` est limité par une contrainte `CHECK` à `ollama | openai | anthropic`. Pour ajouter un type, il faut une migration qui modifie cette contrainte. La ligne seed `ollama-local` pointe sur `http://localhost:11434`, ce qui suppose que le gateway tourne sur l'hôte et non dans compose (là il faudrait `http://ollama:11434`).
+- Le symptôme d'une migration modifiée après coup est un `Migration checksum mismatch` au démarrage : le conteneur gateway passe alors en `Exited (1)`. En local, on repart d'une base vierge avec `docker compose exec postgres psql -U relais -d relais -c "DROP SCHEMA relais CASCADE"`. Préférer ça à `down -v`, qui efface aussi les modèles Ollama. `flyway repair` laisserait en place les tables de l'ancienne version.
+- `provider` (V1) : `kind` est limité par une contrainte `CHECK` à `ollama | openai | anthropic`. Pour ajouter un type, il faut une migration qui modifie cette contrainte. La ligne seed `ollama-local` pointe sur `http://localhost:11434`, ce qui ne fonctionne que pour un gateway lancé sur l'hôte. Depuis le conteneur gateway de compose, il faudrait `http://ollama:11434`.

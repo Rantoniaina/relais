@@ -21,6 +21,17 @@ services:
     volumes:
       - ollama:/root/.ollama
 
+  gateway:
+    build: ./services/gateway          # image nommée relais-gateway
+    ports: ["8080:8080"]
+    environment:
+      DB_HOST: postgres                # nom du service = nom DNS sur le réseau compose
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-relais}
+    depends_on:
+      postgres:
+        condition: service_healthy     # attend pg_isready avant de démarrer
+    restart: unless-stopped
+
 volumes:
   pgdata:
   ollama:
